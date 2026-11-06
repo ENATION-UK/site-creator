@@ -1,0 +1,6 @@
+{
+  "name": "trade-site",
+  "version": "1.0.0",
+  "description": "Build and deploy static export/B2B sites through the trade-site gateway to Cloudflare Pages.",
+  "keywords": ["website", "cloudflare", "export", "b2b", "static-site"]
+}
