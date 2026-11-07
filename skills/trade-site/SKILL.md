@@ -1,6 +1,6 @@
 ---
 name: trade-site
-description: Builds, lists, updates, and deploys static export/B2B websites through the trade-site gateway to Cloudflare Pages. Use for 外贸建站, multi-site catalogs, editing an existing Pages site, or publishing HTML via this gateway.
+description: Builds, lists, updates, and deploys static 外贸独立站 and export/B2B websites through the trade-site gateway to Cloudflare Pages. Use for 外贸独立站、独立站、品牌官网、英文官网、公司官网、外贸建站、询盘站、产品目录站、多语言站、落地页, multi-language catalogs, editing an existing Pages site, or publishing static HTML via this gateway. Site copy is written in the target market's language, with SEO essentials included.
 ---
 
 # Trade Site
@@ -93,7 +93,7 @@ A folder **without** `.trade-site.json` will **create a new live site** on deplo
 1. Collect company, products, market, language, contact, and style. Ask if missing.
 2. Use the user's logo/photos when given; otherwise a simple CSS/SVG mark.
 3. Write files into `sites/<slug>/` (existing slug when updating).
-4. Local preview, revise until the user says go live.
+4. Local preview; run the **Overseas site requirements** checklist below; revise until the user says go live.
 5. Deploy with the bundled script (no hand-written curl):
 
 ```bash
@@ -105,6 +105,27 @@ node <skill-dir>/scripts/deploy.mjs sites/acme-valves --name "Acme Valves"
 ```
 
 6. Give the user the `https://*.pages.dev` URL **and** the local folder `sites/<slug>/`. Tell them a new chat can say: `继续改 sites/<slug>，不要新建站`.
+
+## Overseas site requirements
+
+A site is not done until it passes this list. These are hard requirements, not suggestions.
+
+**Language** — Write every page in the target market's language (English by default; ask when the market is not English-speaking). Chinese is only for talking to the user, never inside the site.
+
+**SEO** — every page has:
+
+- a unique `<title>` (~50–60 chars) and `<meta name="description">` (~140–160 chars)
+- `<html lang="...">`, exactly one `<h1>`, headings in order, descriptive `alt` on every image
+- Open Graph and Twitter card tags
+- `<link rel="canonical">` — add it on the first update after deploy, once the live URL is known
+- `sitemap.xml` and `robots.txt` at the site root (both are on the allowed list above)
+- JSON-LD: `Organization` on the home page, `Product` on product pages, `BreadcrumbList` where pages nest
+
+**Performance** — WebP/AVIF images with explicit `width`/`height` and `loading="lazy"` below the fold; `.woff2` fonts with `font-display: swap`; keep each page under ~500 KB.
+
+**Trust & compliance** — Contact page with the company's real address, email, phone (with country code) and business hours; About page; Privacy Policy page; Terms page when the site collects anything. Add a WhatsApp click-to-chat link when the user has a number. If third-party analytics or ads are added, add a cookie consent banner first.
+
+**Scope** — static only: no cart, checkout, payment, accounts, or server-side form storage. Inquiry goes through `mailto:` or WhatsApp; never point a `<form action>` at a backend you cannot provide.
 
 ## If deploy fails
 
@@ -122,3 +143,5 @@ A malformed `.trade-site.json` or `~/.config/trade-site/credentials.json` makes 
 ## Gateway
 
 Default `https://site.yizo.ai` (`TRADE_SITE_GATEWAY` or `--gateway`). Client key lives in `~/.config/trade-site/credentials.json`. Never put Cloudflare keys in this skill.
+
+The gateway publishes to `*.pages.dev` only — it does not bind custom domains. Do not promise the user their own domain.
