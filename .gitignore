@@ -8,3 +8,5 @@ sites/
 .DS_Store
 .wrangler/
 credentials.json
+.agents/
+gateway/fixtures/*/.trade-site.json

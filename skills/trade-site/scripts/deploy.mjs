@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -15,6 +17,25 @@ import { deflateRawSync } from "node:zlib";
 
 const DEFAULT_GATEWAY = process.env.TRADE_SITE_GATEWAY || "https://site.yizo.ai";
 const MANIFEST_NAME = ".trade-site.json";
+const MAX_FILES = 5000;
+const REQUEST_TIMEOUT_MS = 60_000;
+
+// Kept in sync with gateway/src/site-files.js. Anything else makes the whole deploy fail.
+const ALLOWED_EXT = new Set([
+  ".html", ".htm", ".css", ".js", ".mjs", ".cjs", ".map",
+  ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".avif", ".bmp",
+  ".woff", ".woff2", ".ttf", ".otf", ".eot",
+  ".txt", ".xml", ".json", ".webmanifest",
+]);
+const ALLOWED_BASENAMES = new Set(["_headers", "_redirects"]);
+const FORBIDDEN_BASENAMES = new Set([
+  "_worker.js",
+  "_worker.bundle",
+  "wrangler.toml",
+  "wrangler.json",
+  "wrangler.jsonc",
+  ".env",
+]);
 const CREDENTIALS_PATH = path.join(
   process.env.TRADE_SITE_HOME || process.env.HOME || process.env.USERPROFILE || ".",
   ".config",
@@ -25,10 +46,12 @@ const CREDENTIALS_PATH = path.join(
 function usage() {
   console.error(`Usage:
   node scripts/deploy.mjs --list [--gateway URL]
-  node scripts/deploy.mjs <site-dir> [--name "Company"] [--site SITE_ID] [--email you@x.com] [--agent cursor] [--gateway URL]
+  node scripts/deploy.mjs <site-dir> [--name "Company"] [--site SITE_ID] [--new] [--email you@x.com] [--agent cursor] [--gateway URL]
 
   --list   Show local sites (sites/*) and remote sites on the gateway
-  deploy   Create or update one site. Reuses .trade-site.json / --site when present.`);
+  deploy   Create or update one site. Reuses .trade-site.json / --site when present.
+  --new    Ignore .trade-site.json and create a brand-new site (needed when this
+           folder's site belongs to a client key you no longer have).`);
 }
 
 function crc32(buf) {
@@ -44,13 +67,37 @@ function crc32(buf) {
 
 function walkFiles(root) {
   const out = [];
+  const rootReal = realpathSync(root);
+  const seenDirs = new Set([rootReal]);
   function walk(dir) {
     for (const name of readdirSync(dir)) {
       if (name === ".DS_Store" || name === "Thumbs.db" || name === ".git" || name === MANIFEST_NAME) {
         continue;
       }
       const abs = path.join(dir, name);
-      const st = statSync(abs);
+      const st = lstatSync(abs);
+      if (st.isSymbolicLink()) {
+        let real;
+        try {
+          real = realpathSync(abs);
+        } catch {
+          console.warn(`Skipping broken symlink: ${abs}`);
+          continue;
+        }
+        if (real !== rootReal && !real.startsWith(rootReal + path.sep)) {
+          console.warn(`Skipping symlink that points outside the site folder: ${abs}`);
+          continue;
+        }
+        const target = statSync(real);
+        if (target.isDirectory()) {
+          if (seenDirs.has(real)) continue;
+          seenDirs.add(real);
+          walk(abs);
+        } else {
+          out.push(abs);
+        }
+        continue;
+      }
       if (st.isDirectory()) {
         if (name === "node_modules" || name === "__MACOSX") continue;
         walk(abs);
@@ -61,6 +108,34 @@ function walkFiles(root) {
   }
   walk(root);
   return out;
+}
+
+function assertUploadable(files, root) {
+  const bad = [];
+  for (const abs of files) {
+    const rel = path.relative(root, abs).split(path.sep).join("/");
+    const base = path.posix.basename(rel);
+    const lower = rel.toLowerCase();
+    if (FORBIDDEN_BASENAMES.has(base.toLowerCase()) || lower.split("/").includes("functions")) {
+      bad.push(`${rel} — blocked by the gateway`);
+      continue;
+    }
+    if (ALLOWED_BASENAMES.has(base)) continue;
+    if (!ALLOWED_EXT.has(path.posix.extname(base).toLowerCase())) {
+      bad.push(
+        `${rel} — unsupported file type (static hosting allows HTML, CSS, JS, images, fonts, and .txt/.xml/.json/.webmanifest only)`,
+      );
+    }
+  }
+  if (bad.length > 0) {
+    throw new Error(
+      `These files would make the gateway reject the whole deploy:\n  ${bad.join("\n  ")}\n` +
+        `Move them out of the site folder (or delete them) and deploy again.`,
+    );
+  }
+  if (files.length > MAX_FILES) {
+    throw new Error(`Site has ${files.length} files; the gateway accepts at most ${MAX_FILES}`);
+  }
 }
 
 function u16(n) {
@@ -74,8 +149,7 @@ function u32(n) {
   return b;
 }
 
-function zipDirectory(root, dest) {
-  const files = walkFiles(root);
+function zipDirectory(root, dest, files = walkFiles(root)) {
   if (files.length === 0) throw new Error("Site directory is empty");
   const locals = [];
   const centrals = [];
@@ -86,10 +160,12 @@ function zipDirectory(root, dest) {
     const compressed = deflateRawSync(data);
     const crc = crc32(data);
     const nameBuf = Buffer.from(rel, "utf8");
+    // Bit 11 marks the filename as UTF-8 so non-ASCII names survive other unzip tools.
+    const flags = 0x0800;
     const local = Buffer.concat([
       u32(0x04034b50),
       u16(20),
-      u16(0),
+      u16(flags),
       u16(8),
       u16(0),
       u16(0),
@@ -105,7 +181,7 @@ function zipDirectory(root, dest) {
       u32(0x02014b50),
       u16(20),
       u16(20),
-      u16(0),
+      u16(flags),
       u16(8),
       u16(0),
       u16(0),
@@ -140,6 +216,14 @@ function zipDirectory(root, dest) {
   writeFileSync(dest, Buffer.concat([...locals, centralBuf, end]));
 }
 
+function takeValue(rest, index, flag) {
+  const value = rest[index];
+  if (value === undefined || value.startsWith("-")) {
+    throw new Error(`Missing value for ${flag}`);
+  }
+  return value;
+}
+
 function parseArgs(argv) {
   const args = {
     dir: null,
@@ -149,6 +233,7 @@ function parseArgs(argv) {
     agent: null,
     gateway: null,
     list: false,
+    isNew: false,
     help: false,
   };
   const rest = argv.slice(2);
@@ -156,11 +241,12 @@ function parseArgs(argv) {
     const cur = rest[i];
     if (cur === "--help" || cur === "-h") args.help = true;
     else if (cur === "--list") args.list = true;
-    else if (cur === "--name") args.name = rest[++i];
-    else if (cur === "--site") args.site = rest[++i];
-    else if (cur === "--email") args.email = rest[++i];
-    else if (cur === "--agent") args.agent = rest[++i];
-    else if (cur === "--gateway") args.gateway = rest[++i];
+    else if (cur === "--new") args.isNew = true;
+    else if (cur === "--name") args.name = takeValue(rest, ++i, cur);
+    else if (cur === "--site") args.site = takeValue(rest, ++i, cur);
+    else if (cur === "--email") args.email = takeValue(rest, ++i, cur);
+    else if (cur === "--agent") args.agent = takeValue(rest, ++i, cur);
+    else if (cur === "--gateway") args.gateway = takeValue(rest, ++i, cur);
     else if (!cur.startsWith("-") && !args.dir) args.dir = cur;
     else throw new Error(`Unknown argument: ${cur}`);
   }
@@ -169,13 +255,17 @@ function parseArgs(argv) {
 
 function loadCredentials() {
   if (!existsSync(CREDENTIALS_PATH)) return { sites: {} };
+  let data;
   try {
-    const data = JSON.parse(readFileSync(CREDENTIALS_PATH, "utf8"));
-    data.sites = data.sites || {};
-    return data;
+    data = JSON.parse(readFileSync(CREDENTIALS_PATH, "utf8"));
   } catch {
-    return { sites: {} };
+    throw new Error(
+      `${CREDENTIALS_PATH} is not valid JSON. Fix or delete it before deploying — ` +
+        `deploying with a fresh key would orphan the sites this key owns.`,
+    );
   }
+  data.sites = data.sites || {};
+  return data;
 }
 
 function saveCredentials(data) {
@@ -193,12 +283,20 @@ function readManifest(dir) {
   try {
     return JSON.parse(readFileSync(file, "utf8"));
   } catch {
-    return null;
+    throw new Error(
+      `${file} is not valid JSON. Fix it, or delete it to deploy this folder as a new site.`,
+    );
   }
 }
 
 function writeManifest(dir, data) {
-  const prev = readManifest(dir) || {};
+  let prev = {};
+  try {
+    prev = readManifest(dir) || {};
+  } catch {
+    // A corrupt manifest is being replaced anyway; nothing worth preserving.
+    prev = {};
+  }
   const next = {
     ...prev,
     site_id: data.site_id,
@@ -236,6 +334,10 @@ async function readJson(res) {
   }
 }
 
+function request(url, opts = {}) {
+  return fetch(url, { ...opts, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+}
+
 function resolveGateway(args, creds) {
   return (args.gateway || process.env.TRADE_SITE_GATEWAY || creds.gateway || DEFAULT_GATEWAY).replace(
     /\/$/,
@@ -245,7 +347,7 @@ function resolveGateway(args, creds) {
 
 async function ensureClient(creds, gateway, args) {
   if (creds.client_id && creds.client_key) return creds;
-  const res = await fetch(`${gateway}/v1/clients/register`, {
+  const res = await request(`${gateway}/v1/clients/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -279,8 +381,12 @@ function listLocalSiteDirs() {
   if (existsSync(sitesRoot) && statSync(sitesRoot).isDirectory()) {
     for (const name of readdirSync(sitesRoot)) {
       const dir = path.join(sitesRoot, name);
-      if (statSync(dir).isDirectory() && existsSync(path.join(dir, "index.html"))) {
-        dirs.push(dir);
+      try {
+        if (statSync(dir).isDirectory() && existsSync(path.join(dir, "index.html"))) {
+          dirs.push(dir);
+        }
+      } catch {
+        console.warn(`Skipping unreadable entry: ${path.join("sites", name)}`);
       }
     }
   }
@@ -291,7 +397,7 @@ function listLocalSiteDirs() {
 
 async function fetchRemoteSites(creds, gateway) {
   if (!creds.client_id || !creds.client_key) return [];
-  const res = await fetch(`${gateway}/v1/sites`, {
+  const res = await request(`${gateway}/v1/sites`, {
     headers: { Authorization: `Bearer ${creds.client_key}` },
   });
   const body = await readJson(res);
@@ -307,7 +413,14 @@ function pad(value, width) {
 }
 
 async function listSites(args) {
-  const creds = loadCredentials();
+  let creds;
+  let credsError = null;
+  try {
+    creds = loadCredentials();
+  } catch (err) {
+    creds = { sites: {} };
+    credsError = err.message;
+  }
   const gateway = resolveGateway(args, creds);
   const localDirs = listLocalSiteDirs();
   console.log("Local sites");
@@ -316,7 +429,14 @@ async function listSites(args) {
   } else {
     for (const dir of localDirs) {
       const rel = path.relative(process.cwd(), dir) || dir;
-      const manifest = readManifest(dir);
+      let manifest = null;
+      try {
+        manifest = readManifest(dir);
+      } catch (err) {
+        console.log(`  ${rel}`);
+        console.log(`    ${err.message}`);
+        continue;
+      }
       const mapped = creds.sites?.[dir];
       const siteId = manifest?.site_id || mapped || "(unlinked — deploy would CREATE a new site)";
       const name = manifest?.name || path.basename(dir);
@@ -328,13 +448,26 @@ async function listSites(args) {
     }
   }
 
+  if (credsError) {
+    console.log("\nRemote sites");
+    console.log(`  ${credsError}`);
+    return;
+  }
+
   if (!creds.client_id || !creds.client_key) {
     console.log("\nRemote sites");
     console.log("  (no credentials yet — first deploy will register this machine)");
     return;
   }
 
-  const remote = await fetchRemoteSites(creds, gateway);
+  let remote;
+  try {
+    remote = await fetchRemoteSites(creds, gateway);
+  } catch (err) {
+    console.log("\nRemote sites");
+    console.log(`  (could not reach ${gateway}: ${err.message})`);
+    return;
+  }
   console.log("\nRemote sites");
   if (remote.length === 0) {
     console.log("  (none on gateway)");
@@ -349,33 +482,46 @@ async function listSites(args) {
   }
 }
 
-function resolveSiteId(args, siteDir, creds) {
+function resolveSiteId(args, siteDir, creds, manifest = null) {
+  if (args.isNew) return null;
   if (args.site) return args.site;
-  const manifest = readManifest(siteDir);
   if (manifest?.site_id) return manifest.site_id;
   if (creds.sites?.[siteDir]) return creds.sites[siteDir];
   return null;
 }
 
 async function deploySite(args) {
+  if (args.isNew && args.site) {
+    throw new Error("Use either --new or --site, not both");
+  }
   const siteDir = path.resolve(args.dir);
   if (!existsSync(path.join(siteDir, "index.html"))) {
     throw new Error(`No index.html in ${siteDir}`);
   }
 
+  let manifest = null;
+  try {
+    manifest = readManifest(siteDir);
+  } catch (err) {
+    if (!args.isNew) throw err;
+    console.warn(err.message);
+  }
+
+  const files = walkFiles(siteDir);
+  assertUploadable(files, siteDir);
+
   let creds = loadCredentials();
   const gateway = resolveGateway(args, creds);
   creds = await ensureClient(creds, gateway, args);
 
-  const manifest = readManifest(siteDir);
-  const siteId = resolveSiteId(args, siteDir, creds);
+  const siteId = resolveSiteId(args, siteDir, creds, manifest);
   const name =
     args.name || manifest?.name || path.basename(siteDir) || "site";
 
   const tmp = mkdtempSync(path.join(os.tmpdir(), "trade-site-zip-"));
   const zipPath = path.join(tmp, "site.zip");
   try {
-    zipDirectory(siteDir, zipPath);
+    zipDirectory(siteDir, zipPath, files);
     const zip = readFileSync(zipPath);
     const form = new FormData();
     form.set("zip", new Blob([zip], { type: "application/zip" }), "site.zip");
@@ -384,17 +530,28 @@ async function deploySite(args) {
     const url = siteId ? `${gateway}/v1/sites/${siteId}/deploy` : `${gateway}/v1/sites`;
     if (siteId) {
       console.log(`Updating existing site ${siteId}`);
+      if (args.name) {
+        console.log(`Note: --name only applies when creating a site; the live name is unchanged.`);
+      }
     } else {
-      console.log("Creating a NEW site (no .trade-site.json / --site found)");
+      console.log("Creating a NEW site (no .trade-site.json / --site / --new found)");
     }
 
-    const res = await fetch(url, {
+    const res = await request(url, {
       method: "POST",
       headers: { Authorization: `Bearer ${creds.client_key}` },
       body: form,
     });
     const body = await readJson(res);
     if (!res.ok) {
+      if (res.status === 404 || body.code === "SITE_NOT_FOUND") {
+        throw new Error(
+          `Site ${siteId} is not accessible with this client key ` +
+            `(different machine, reset credentials, or a copied folder).\n` +
+            `  - rerun with --new to create a new live site from this folder, or\n` +
+            `  - delete ${manifestPath(siteDir)} to let this folder start over.`,
+        );
+      }
       throw new Error(`${body.code || res.status}: ${body.error || "deploy failed"}`);
     }
     creds.sites[siteDir] = body.id;

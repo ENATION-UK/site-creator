@@ -45,6 +45,10 @@ function zipUpload(req, res, next) {
       );
       return;
     }
+    if (err instanceof multer.MulterError) {
+      sendError(res, new ApiError(400, "INVALID_UPLOAD", err.message));
+      return;
+    }
     next(err);
   });
 }

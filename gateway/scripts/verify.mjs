@@ -37,6 +37,14 @@ function zipOf(dir) {
   return zipPath;
 }
 
+// Deploy writes .trade-site.json into the folder it deploys, so never point it at fixtures/.
+function stageFixture(name) {
+  const dest = path.join(tmp, `fixture-${name}`);
+  fs.cpSync(path.join(gatewayRoot, "fixtures", name), dest, { recursive: true });
+  fs.rmSync(path.join(dest, ".trade-site.json"), { force: true });
+  return dest;
+}
+
 async function req(pathname, opts = {}) {
   const res = await fetch(base + pathname, opts);
   const text = await res.text();
@@ -66,7 +74,8 @@ try {
   const { client_id, client_key } = registered.body;
   const auth = { Authorization: `Bearer ${client_key}` };
 
-  const okZip = zipOf(path.join(gatewayRoot, "fixtures", "ok-site"));
+  const okSite = stageFixture("ok-site");
+  const okZip = zipOf(okSite);
   const created = await req("/v1/sites", {
     method: "POST",
     headers: auth,
@@ -96,7 +105,7 @@ try {
   const listed = await req("/v1/sites", { headers: auth });
   assert(listed.body.sites.length === 1, "list count");
 
-  const badZip = zipOf(path.join(gatewayRoot, "fixtures", "bad-worker"));
+  const badZip = zipOf(stageFixture("bad-worker"));
   const forbidden = await req("/v1/sites", {
     method: "POST",
     headers: auth,
@@ -161,7 +170,7 @@ try {
   const scriptOut = await new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
-      [deployScript, path.join(gatewayRoot, "fixtures", "ok-site"), "--name", "ScriptSite", "--agent", "verify"],
+      [deployScript, okSite, "--name", "ScriptSite", "--agent", "verify"],
       {
         env: {
           ...process.env,

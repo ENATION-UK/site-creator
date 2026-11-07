@@ -1,17 +1,37 @@
+import { timingSafeEqual } from "node:crypto";
 import { config } from "./config.js";
 import { getDb } from "./db.js";
 import { ApiError, sendError } from "./errors.js";
 import { hashKey, utcNow } from "./ids.js";
 
 const hits = new Map();
+const MAX_RATE_LIMIT_KEYS = 5000;
+
+function sweep(now) {
+  if (hits.size <= MAX_RATE_LIMIT_KEYS) return;
+  for (const [key, bucket] of hits) {
+    if (now - bucket.start >= bucket.windowMs) hits.delete(key);
+  }
+  while (hits.size > MAX_RATE_LIMIT_KEYS) {
+    hits.delete(hits.keys().next().value);
+  }
+}
+
+function safeEqual(a, b) {
+  const left = Buffer.from(String(a));
+  const right = Buffer.from(String(b));
+  if (left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
+}
 
 export function rateLimit({ windowMs, max, keyFn }) {
   return (req, res, next) => {
     const key = keyFn(req);
     const now = Date.now();
+    sweep(now);
     let bucket = hits.get(key);
     if (!bucket || now - bucket.start >= windowMs) {
-      bucket = { start: now, count: 0 };
+      bucket = { start: now, count: 0, windowMs };
       hits.set(key, bucket);
     }
     bucket.count += 1;
@@ -60,7 +80,9 @@ export function adminAuth(req, res, next) {
   const sep = decoded.indexOf(":");
   const user = sep === -1 ? decoded : decoded.slice(0, sep);
   const pass = sep === -1 ? "" : decoded.slice(sep + 1);
-  if (user !== config.adminUser || pass !== config.adminPassword) {
+  const userOk = safeEqual(user, config.adminUser);
+  const passOk = safeEqual(pass, config.adminPassword);
+  if (!userOk || !passOk) {
     res.set("WWW-Authenticate", 'Basic realm="trade-site-admin"');
     res.status(401).send("Invalid credentials");
     return;
